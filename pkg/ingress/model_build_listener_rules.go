@@ -21,6 +21,7 @@ func (t *defaultModelBuildTask) buildListenerRules(ctx context.Context, lsARN co
 
 	var rules []Rule
 	for _, ing := range ingList {
+
 		for _, rule := range ing.Ing.Spec.Rules {
 			if rule.HTTP == nil {
 				continue
@@ -314,4 +315,30 @@ func (t *defaultModelBuildTask) buildListenerRuleTags(_ context.Context, ing Cla
 	}
 
 	return algorithm.MergeStringMap(t.defaultTags, ingTags), nil
+}
+
+func (t *defaultModelBuildTask) classifyRulesByBackend(ingresses []networking.IngressRule) ([]networking.IngressRule, []networking.IngressRule, error) {
+	var ruleWithDuplicatedBackends []networking.IngressRule
+	var ruleWithUniqueBackends []networking.IngressRule
+	backendSet := make(map[string][]networking.IngressRule)
+	for _, rule := range ingresses {
+		if rule.HTTP == nil {
+			ruleWithUniqueBackends = append(ruleWithUniqueBackends, rule)
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {			
+			backendKey := fmt.Sprintf("%s:%s", path.Backend.Service.Name, path.Backend.Service.Port.String())
+			ruleWithOnePath := *rule.DeepCopy()
+			ruleWithOnePath.HTTP.Paths = []networking.HTTPIngressPath{path}
+			backendSet[backendKey] = append(backendSet[backendKey], ruleWithOnePath)
+		}
+	}
+	for _, rule := range backendSet {
+		if len(rule) > 1 {
+			ruleWithDuplicatedBackends = append(ruleWithDuplicatedBackends, rule...)
+		} else {
+			ruleWithUniqueBackends = append(ruleWithUniqueBackends, rule...)
+		}
+	}
+	return ruleWithUniqueBackends, ruleWithDuplicatedBackends, nil
 }
