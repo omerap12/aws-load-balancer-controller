@@ -18,11 +18,25 @@ func (t *defaultModelBuildTask) buildListenerRules(ctx context.Context, lsARN co
 	if t.sslRedirectConfig != nil && protocol == elbv2model.ProtocolHTTP {
 		return nil
 	}
-
-	var rules []Rule
+	
+	
 	for _, ing := range ingList {
+		var mergeBy string
+		mergeByAnnotation := t.annotationParser.ParseStringAnnotation("alb.ingress.kubernetes.io/merge-by", &mergeBy, ing.Ing.Annotations)
 
-		for _, rule := range ing.Ing.Spec.Rules {
+		var rules []Rule
+		ingressRules := ing.Ing.Spec.Rules
+		if mergeByAnnotation {
+			uniqueIngresses, duplicatedIngresses := t.classifyRulesByBackend(ing.Ing.Spec.Rules)
+			ingressRules = uniqueIngresses
+			
+			duplicatedCombinedRules, err := t.buildCombinedRules(duplicatedIngresses, ctx, protocol, ing, mergeBy)
+			if err != nil {
+				return errors.Wrapf(err, "ingress: %v", k8s.NamespacedName(ing.Ing))
+			}
+			rules = append(rules, duplicatedCombinedRules...)
+		}
+		for _, rule := range ingressRules {
 			if rule.HTTP == nil {
 				continue
 			}
@@ -57,6 +71,8 @@ func (t *defaultModelBuildTask) buildListenerRules(ctx context.Context, lsARN co
 			}
 		}
 	}
+
+
 	optimizedRules, err := t.ruleOptimizer.Optimize(ctx, port, protocol, rules)
 	if err != nil {
 		return err
@@ -317,7 +333,7 @@ func (t *defaultModelBuildTask) buildListenerRuleTags(_ context.Context, ing Cla
 	return algorithm.MergeStringMap(t.defaultTags, ingTags), nil
 }
 
-func (t *defaultModelBuildTask) classifyRulesByBackend(ingresses []networking.IngressRule) ([]networking.IngressRule, []networking.IngressRule, error) {
+func (t *defaultModelBuildTask) classifyRulesByBackend(ingresses []networking.IngressRule) ([]networking.IngressRule, []networking.IngressRule) {
 	var ruleWithDuplicatedBackends []networking.IngressRule
 	var ruleWithUniqueBackends []networking.IngressRule
 	backendSet := make(map[string][]networking.IngressRule)
@@ -326,7 +342,7 @@ func (t *defaultModelBuildTask) classifyRulesByBackend(ingresses []networking.In
 			ruleWithUniqueBackends = append(ruleWithUniqueBackends, rule)
 			continue
 		}
-		for _, path := range rule.HTTP.Paths {			
+		for _, path := range rule.HTTP.Paths {
 			backendKey := fmt.Sprintf("%s:%s", path.Backend.Service.Name, path.Backend.Service.Port.String())
 			ruleWithOnePath := *rule.DeepCopy()
 			ruleWithOnePath.HTTP.Paths = []networking.HTTPIngressPath{path}
@@ -340,5 +356,45 @@ func (t *defaultModelBuildTask) classifyRulesByBackend(ingresses []networking.In
 			ruleWithUniqueBackends = append(ruleWithUniqueBackends, rule...)
 		}
 	}
-	return ruleWithUniqueBackends, ruleWithDuplicatedBackends, nil
+	return ruleWithUniqueBackends, ruleWithDuplicatedBackends
+}
+
+func (t *defaultModelBuildTask) buildCombinedRules(ingressRules []networking.IngressRule, ctx context.Context, protocol elbv2model.Protocol, ing ClassifiedIngress, mergeBy string) ([]Rule, error) {
+	var rules []Rule
+	for _, rule := range ingressRules {
+
+		if rule.HTTP == nil {
+			continue
+		}
+		paths, err := t.sortIngressPaths(rule.HTTP.Paths)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range paths {
+			enhancedBackend, err := t.enhancedBackendBuilder.Build(ctx, ing.Ing, path.Backend,
+				WithLoadBackendServices(true, t.backendServices),
+				WithLoadAuthConfig(true))
+			if err != nil {
+				return nil, err
+			}
+			conditions, err := t.buildRuleConditions(ctx, rule, path, enhancedBackend)
+			if err != nil {
+				return nil, err
+			}
+			actions, err := t.buildActions(ctx, protocol, ing, enhancedBackend)
+			if err != nil {
+				return nil, err
+			}
+			tags, err := t.buildListenerRuleTags(ctx, ing)
+			if err != nil {
+				return nil, err
+			}
+			rules = append(rules, Rule{
+				Conditions: conditions,
+				Actions:    actions,
+				Tags:       tags,
+			})
+		}
+	}
+	return rules, nil
 }
